@@ -1,3 +1,4 @@
+import functools
 import traceback
 
 from vanilla import Group, ComboBox, TextBox, Slider, EditText, PopUpButton, Button
@@ -5,6 +6,17 @@ from GlyphsApp.UI import GlyphView
 from GlyphsApp import Message
 from AppKit import NSColor
 from HTLSLibrary import HTLSEngine
+
+
+def guarded(method):
+	"""Keep exceptions out of vanilla's callback machinery, which reports them as a plug-in crash."""
+	@functools.wraps(method)
+	def wrapper(self, *args, **kwargs):
+		try:
+			return method(self, *args, **kwargs)
+		except Exception:
+			print("HTLS Manager: error while running %s\n%s" % (method.__name__, traceback.format_exc()))
+	return wrapper
 
 
 def text(value):
@@ -93,6 +105,7 @@ class HTLSGlyphView:
 
 		self.view_group.addAutoPosSizeRules(view_group_rules, self.parent.metrics)
 
+	@guarded
 	def glyph_selector_callback(self, sender):
 		if sender.get() in self.glyphs:
 			self.set_glyph(sender.get())
@@ -257,6 +270,7 @@ class HTLSParameterSlider:
 			self.parent.parameters_for_master(self.master_id)[self.parameter]
 		)
 
+	@guarded
 	def enter_parameter_callback(self, sender):
 		# if the sender is the slider, update the value text field
 		if sender == self.parent.master_parameters_sliders[self.parameter]:

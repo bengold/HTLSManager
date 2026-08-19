@@ -1,6 +1,7 @@
 # encoding: utf-8
 
 from __future__ import division, print_function, unicode_literals
+import functools
 import objc
 import os
 import traceback
@@ -45,6 +46,65 @@ def read_master_parameter(master, parameter):
 
 def report_error(context):
 	print("HTLS Manager: error while %s\n%s" % (context, traceback.format_exc()))
+
+
+def guarded(method):
+	"""Keep exceptions inside a callback.
+
+	vanilla calls the callbacks straight from the AppKit action, so anything that escapes is reported by
+	Glyphs as a plug-in crash and leaves the window in a half-updated state.
+	"""
+	@functools.wraps(method)
+	def wrapper(self, *args, **kwargs):
+		try:
+			return method(self, *args, **kwargs)
+		except Exception:
+			report_error("running %s" % method.__name__)
+	return wrapper
+
+
+# vanilla's close() either works or it does not, so the traceback is only worth printing once
+_reported_broken_close = []
+
+
+def close_vanilla_window(window, context="closing a window"):
+	"""Close a vanilla window or sheet.
+
+	vanilla closes a window by calling -close on the NSWindow it wraps, which raises
+	"TypeError: Need 1 arguments, got 0" with the PyObjC version that Glyphs 4 ships. Dismiss the NSWindow
+	directly when that happens, so a sheet cannot get stuck on screen.
+	"""
+	if window is None:
+		return
+	try:
+		window.close()
+		return
+	except Exception:
+		if not _reported_broken_close:
+			_reported_broken_close.append(True)
+			report_error(context)
+
+	ns_window = None
+	for get_ns_window in (lambda: window.getNSWindow(), lambda: window._window):
+		try:
+			ns_window = get_ns_window()
+		except Exception:
+			continue
+		if ns_window is not None:
+			break
+	if ns_window is None:
+		return
+
+	try:
+		# a sheet has to be handed back to the window it is attached to
+		sheet_parent = ns_window.sheetParent()
+		if sheet_parent is not None:
+			sheet_parent.endSheet_(ns_window)
+		ns_window.orderOut_(None)
+		# performSelector_ side-steps the argument count that broke the direct call
+		ns_window.performSelector_("close")
+	except Exception:
+		report_error(context)
 
 
 class HTLSManager(GeneralPlugin):
@@ -643,6 +703,7 @@ class HTLSManager(GeneralPlugin):
 			Glyphs.addCallback(self.document_will_close, DOCUMENTWILLCLOSE)
 
 	@objc.python_method
+	@guarded
 	def font_rules_help(self, sender):
 		self.fontRulesHelpView = Popover((1, 1))
 		self.fontRulesHelpView.description = TextBox(
@@ -668,6 +729,7 @@ class HTLSManager(GeneralPlugin):
 		self.fontRulesHelpView.open(parentView=self.fontRulesTab.helpButton, preferredEdge="bottom")
 
 	@objc.python_method
+	@guarded
 	def add_font_rule_callback(self, sender):
 		for category in self.categories:
 			if getattr(self.fontRulesTab, category).addButton == sender:
@@ -713,6 +775,7 @@ class HTLSManager(GeneralPlugin):
 		self.check_for_conflicting_rules()
 
 	@objc.python_method
+	@guarded
 	def remove_font_rule_callback(self, sender):
 		for category in self.categories:
 			for rule in list(self.font_rules[category]):
@@ -747,6 +810,7 @@ class HTLSManager(GeneralPlugin):
 		self.check_for_conflicting_rules()
 
 	@objc.python_method
+	@guarded
 	def update_font_rule(self, sender):
 		for category in self.categories:
 			for rule in self.font_rules[category]:
@@ -818,6 +882,7 @@ class HTLSManager(GeneralPlugin):
 				self.add_font_rule(rule_id, category, font_rules=new_rules)
 
 	@objc.python_method
+	@guarded
 	def update_master_rule(self, sender):
 		if not self.font.selectedFontMaster.userData["HTLSManagerMasterRules"]:
 			self.font.selectedFontMaster.userData["HTLSManagerMasterRules"] = {}
@@ -846,6 +911,7 @@ class HTLSManager(GeneralPlugin):
 		self.InspectorTabGlyphInfo.set_exception_settings()
 
 	@objc.python_method
+	@guarded
 	def reset_master_rule(self, sender):
 		for rule in list(self.master_rules_groups):
 			if self.master_rules_groups[rule].resetButton == sender:
@@ -909,6 +975,7 @@ class HTLSManager(GeneralPlugin):
 		master.customParameters[parameter] = value
 
 	@objc.python_method
+	@guarded
 	def reset_parameters(self, sender):
 		for master_id in self.parameters_dict:
 			master = self.font.masters[master_id]
@@ -922,6 +989,7 @@ class HTLSManager(GeneralPlugin):
 		self.update_parameter_ui()
 
 	@objc.python_method
+	@guarded
 	def save_parameters(self, sender):
 		self.parameters_dict = {
 			master.id: {
@@ -943,6 +1011,7 @@ class HTLSManager(GeneralPlugin):
 		self.rightGlyphView.update_layer(self.font.selectedFontMaster)
 
 	@objc.python_method
+	@guarded
 	def link_master_callback(self, sender):
 		master_to_link = None
 		for master in self.font.masters:
@@ -962,10 +1031,23 @@ class HTLSManager(GeneralPlugin):
 		self.apply_parameters_to_selection()
 
 	@objc.python_method
+	@guarded
 	def interpolate_parameters_callback(self, sender):
+		# check everything the sheet needs before opening it, so it never has to be closed from an alert
+		if not self.font.axes:
+			Message(title="No axes", message="The font has no axes to interpolate along.")
+			return
+
 		self.interpolation_masters = [
 			master for master in self.font.masters if master is not self.font.selectedFontMaster
 		]
+		if len(self.interpolation_masters) < 2:
+			Message(
+				title="Not enough masters",
+				message="Interpolating needs two other masters to interpolate between."
+			)
+			return
+
 		self.interpolation_sheet = Sheet((240, 220), self.w)
 
 		self.interpolation_sheet.axis = Group("auto")
@@ -1034,10 +1116,9 @@ class HTLSManager(GeneralPlugin):
 		self.interpolation_sheet.open()
 
 	@objc.python_method
+	@guarded
 	def interpolate_parameters(self, sender):
-		if not self.font.axes:
-			Message(title="No axes", message="The font has no axes to interpolate along.")
-			self.close_interpolation_sheet()
+		if getattr(self, "interpolation_sheet", None) is None:
 			return
 
 		axis_index = self.interpolation_sheet.axis.select.get()
@@ -1078,11 +1159,15 @@ class HTLSManager(GeneralPlugin):
 		self.close_interpolation_sheet()
 
 	@objc.python_method
+	@guarded
 	def close_interpolation_sheet(self, sender=None):
-		self.interpolation_sheet.close()
-		del self.interpolation_sheet
+		sheet = getattr(self, "interpolation_sheet", None)
+		# drop the reference first, so a second call cannot close the sheet twice
+		self.interpolation_sheet = None
+		close_vanilla_window(sheet, "closing the interpolation sheet")
 
 	@objc.python_method
+	@guarded
 	def switch_tabs(self, sender, tab_index=None):
 		if getattr(self, "w", None) is None:
 			return
@@ -1098,6 +1183,7 @@ class HTLSManager(GeneralPlugin):
 			self.update_inspector_view()
 
 	@objc.python_method
+	@guarded
 	def document_will_close(self, sender):
 		# the window is built from objects of one font, so it cannot outlive that font
 		font = getattr(self, "font", None)
@@ -1251,6 +1337,7 @@ class HTLSManager(GeneralPlugin):
 			self.glyphInspectorTab.inspector.addRule.addButton.enable(True)
 
 	@objc.python_method
+	@guarded
 	def add_font_rule_from_glyph_inspector(self, sender):
 		if not self.check_reference_glyph(self.glyphInspectorTab.inspector.addRule.referenceGlyph.select):
 			return
@@ -1281,6 +1368,7 @@ class HTLSManager(GeneralPlugin):
 		)
 
 	@objc.python_method
+	@guarded
 	def check_factor_is_float(self, sender):
 		try:
 			float(sender.get())
@@ -1320,6 +1408,7 @@ class HTLSManager(GeneralPlugin):
 		self.areaSettings.reset_slider_position(value)
 
 	@objc.python_method
+	@guarded
 	def toggle_live_preview(self, sender):
 		self.live_preview = sender.get()
 
@@ -1371,6 +1460,7 @@ class HTLSManager(GeneralPlugin):
 				self.parametersTab.rightGlyphView.currentRightSideBearing.set(str(layer_rsb))
 
 	@objc.python_method
+	@guarded
 	def load_profile(self, sender):
 		profile_name = sender.getItem()
 		if profile_name in self.user_profiles:
@@ -1381,6 +1471,7 @@ class HTLSManager(GeneralPlugin):
 			self.write_font_rules()
 
 	@objc.python_method
+	@guarded
 	def save_profile(self, sender):
 		proposed_name = "New profile"
 		index = 2
@@ -1406,6 +1497,7 @@ class HTLSManager(GeneralPlugin):
 			Glyphs.defaults["com.eweracs.HTLSManager.userProfiles"] = self.user_profiles
 
 	@objc.python_method
+	@guarded
 	def manage_profiles_callback(self, sender):
 		if len(self.user_profiles) == 1:
 			Message(title="No profiles found", message="Create some profiles first.")
@@ -1459,6 +1551,7 @@ class HTLSManager(GeneralPlugin):
 		self.manage_profiles_sheet.open()
 
 	@objc.python_method
+	@guarded
 	def rename_profile_callback(self, sender):
 		for i, button in enumerate(self.rename_profile_buttons):
 			if button == sender:
@@ -1473,10 +1566,12 @@ class HTLSManager(GeneralPlugin):
 					self.profile_groups[i].title.set(new_profile_name)
 					self.fontRulesTab.profiles.selector.setItems(["Choose..."] + list(self.user_profiles.keys()))
 					Glyphs.defaults["com.eweracs.HTLSManager.userProfiles"] = self.user_profiles
-					self.manage_profiles_sheet.resize(1, 1)
+					if self.manage_profiles_sheet is not None:
+						self.manage_profiles_sheet.resize(1, 1)
 				break
 
 	@objc.python_method
+	@guarded
 	def delete_profile_callback(self, sender):
 		for i, button in enumerate(self.delete_profile_buttons):
 			if button == sender:
@@ -1486,7 +1581,8 @@ class HTLSManager(GeneralPlugin):
 					informativeText="Are you sure you want to delete the profile %s?" % profile_name
 				):
 					return
-				self.manage_profiles_sheet.stackView.removeView(self.profile_groups[i])
+				if self.manage_profiles_sheet is not None:
+					self.manage_profiles_sheet.stackView.removeView(self.profile_groups[i])
 				del self.user_profiles[self.profile_groups[i].title.get()]
 				del self.profile_groups[i]
 				del self.delete_profile_buttons[i]
@@ -1497,11 +1593,15 @@ class HTLSManager(GeneralPlugin):
 		Glyphs.defaults["com.eweracs.HTLSManager.userProfiles"] = self.user_profiles
 
 	@objc.python_method
+	@guarded
 	def close_manage_profiles_sheet(self, sender):
-		self.manage_profiles_sheet.close()
-		del self.manage_profiles_sheet
+		sheet = getattr(self, "manage_profiles_sheet", None)
+		# drop the reference first, so a second call cannot close the sheet twice
+		self.manage_profiles_sheet = None
+		close_vanilla_window(sheet, "closing the profiles sheet")
 
 	@objc.python_method
+	@guarded
 	def import_config_file(self, sender):
 
 		current_path = self.font.filepath
@@ -1525,6 +1625,7 @@ class HTLSManager(GeneralPlugin):
 		self.write_font_rules()
 
 	@objc.python_method
+	@guarded
 	def export_config_file(self, sender):
 
 		# get the font file name without the extension, the font may never have been saved
@@ -1611,6 +1712,7 @@ class HTLSManager(GeneralPlugin):
 		Glyphs.defaults["com.eweracs.HTLSManager.userProfiles"] = self.user_profiles
 
 	@objc.python_method
+	@guarded
 	def close(self, sender):
 		try:
 			Glyphs.removeCallback(self.ui_update)
@@ -1631,7 +1733,10 @@ class HTLSManager(GeneralPlugin):
 		if window is None:
 			return
 		# closing triggers the "close" binding, which clears self.w
-		window.close()
+		close_vanilla_window(window, "closing the window")
+		if getattr(self, "w", None) is not None:
+			# the window did not report the close, so run the clean-up here
+			self.close(None)
 
 	@objc.python_method
 	def __file__(self):
