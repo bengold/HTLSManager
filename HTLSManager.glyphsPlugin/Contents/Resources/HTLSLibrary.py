@@ -6,9 +6,29 @@ from __future__ import division, print_function, unicode_literals
 # program dependencies
 from GlyphsApp import Glyphs, Message
 import math
+import traceback
 from Foundation import NSMinX, NSMaxX, NSMinY, NSMaxY, NSMakePoint
 
 paramFreq = 4
+
+
+def master_parameter(master, parameter, default):
+	"""Read an integer HTLS parameter off a master, falling back to a default."""
+	try:
+		value = master.customParameters[parameter]
+	except Exception:
+		return default
+	try:
+		return int(float(value))
+	except (TypeError, ValueError):
+		return default
+
+
+def has_aligned_width(layer):
+	try:
+		return bool(layer.hasAlignedWidth())
+	except Exception:
+		return False
 
 
 # point list area
@@ -19,19 +39,30 @@ def area(points):
 	return abs(s) * 0.5
 
 
+def intersections(layer, start_point, end_point):
+	# the ObjC selector is not available in every Glyphs version, so fall back to the documented wrapper
+	if hasattr(layer, "calculateIntersectionsStartPoint_endPoint_"):
+		result = layer.calculateIntersectionsStartPoint_endPoint_(start_point, end_point)
+	else:
+		result = layer.intersectionsBetweenPoints(start_point, end_point)
+
+	# depending on the version the intersections come back as NSValue or as plain points
+	return [point.pointValue() if hasattr(point, "pointValue") else point for point in result]
+
+
 # get margins in Glyphs
 def get_margins(layer, y):
 	start_point = NSMakePoint(NSMinX(layer.bounds) - 1, y)
 	end_point = NSMakePoint(NSMaxX(layer.bounds) + 1, y)
 
-	result = layer.calculateIntersectionsStartPoint_endPoint_(start_point, end_point)
+	result = intersections(layer, start_point, end_point)
 	count = len(result)
 	if count <= 2:
 		return None, None
 
 	left = 1
 	right = count - 2
-	return result[left].pointValue().x, result[right].pointValue().x
+	return result[left].x, result[right].x
 
 
 def triangle(angle, y):
@@ -109,6 +140,10 @@ def max_points(points):
 	# pointsFilteredL = [ x for x in points[0] if x.y>=minY and x.y<=maxY]
 	# pointsFilteredR = [ x for x in points[0] if x.y>=minY and x.y<=maxY]
 
+	# without any measurements there are no extremes to report
+	if not points[0] or not points[1]:
+		return None, None
+
 	# sort all given points by x
 	sort_points_by_xl = sorted(points[0], key=lambda tup: tup[0])
 	sort_points_by_xr = sorted(points[1], key=lambda tup: tup[0])
@@ -121,6 +156,8 @@ def max_points(points):
 
 
 def diagonize(margins_l, margins_r):
+	if len(margins_l) < 2 or len(margins_r) < 2:
+		return margins_l, margins_r
 	ystep = abs(margins_l[0].y - margins_l[1].y)
 	for i in range(len(margins_l) - 1):
 		if margins_l[i + 1].x - margins_l[i].x > ystep:
@@ -142,12 +179,18 @@ def read_config(font):
 
 	font_rules = {}
 
-	nsdict_fontrules = font.userData["com.eweracs.HTLSManager.fontRules"]
+	try:
+		nsdict_fontrules = font.userData["com.eweracs.HTLSManager.fontRules"]
+	except Exception:
+		nsdict_fontrules = None
 	if nsdict_fontrules:
 		for category in nsdict_fontrules:
 			font_rules[category] = {}
 			for rule_id in nsdict_fontrules[category]:
-				font_rules[category][rule_id] = dict(nsdict_fontrules[category][rule_id])
+				try:
+					font_rules[category][rule_id] = dict(nsdict_fontrules[category][rule_id])
+				except (TypeError, ValueError):
+					continue
 
 	# if the category is not in the dictionary, add it
 	for category in categories:
@@ -162,12 +205,14 @@ class HTLSEngine:
 	def __init__(self, layer, parent=None):
 		self.categories = ["Letter", "Number", "Punctuation", "Symbol", "Mark"]
 		self.parent = parent
-		self.font = layer.parent.parent
-		self.master = layer.master
 		self.layer = layer
-		self.glyph = layer.parent
-		if not self.glyph.name:
-			return
+
+		# every attribute is set up front: an engine built on an unusable layer stays inert instead of
+		# raising an AttributeError further down
+		self.valid = False
+		self.font = None
+		self.master = None
+		self.glyph = None
 		self.reference_layer = layer
 		self.minYref = None
 		self.maxYref = None
@@ -175,33 +220,56 @@ class HTLSEngine:
 		self.maxY = None
 		self.newR = None
 		self.newL = None
+		self.distance_l = 0
+		self.distance_r = 0
 		self.tabular_width = False
 		self.skip_LSB = False
 		self.skip_RSB = False
-		self.xHeight = int(self.master.xHeight)
-		self.angle = layer.italicAngle
-		self.upm = int(self.master.font.upm)
+		self.xHeight = 0
+		self.angle = 0
+		self.upm = 1000
 		self.factor = 1
-		self.output = "Spacing...\nLayer: %s (%s)\n" % (self.layer.parent.name, self.master.name)
+		self.rule = None
+		self.master_rules = None
+		self.l_polygon = None
+		self.r_polygon = None
+		self.config = {category: {} for category in self.categories}
+		self.output = ""
+
+		if layer is None:
+			return
+
+		self.glyph = layer.parent
+		if self.glyph is None or not self.glyph.name:
+			return
+
+		self.font = self.glyph.parent
+		if self.font is None:
+			return
+
+		try:
+			self.master = layer.master or self.font.masters[layer.associatedMasterId]
+		except Exception:
+			self.master = None
+		if self.master is None:
+			return
+
+		self.xHeight = int(self.master.xHeight)
+		self.angle = layer.italicAngle or 0
+		self.upm = int(self.font.upm)
+		self.output = "Spacing...\nLayer: %s (%s)\n" % (self.glyph.name, self.master.name)
 
 		self.config = read_config(self.font)
 		self.master_rules = self.master.userData["HTLSManagerMasterRules"]
 
-		try:
-			self.paramArea = int(self.master.customParameters["paramArea"] or 400)
-			self.paramDepth = int(self.master.customParameters["paramDepth"] or 12)
-		except:
-			Message(
-				title="Error reading master parameters",
-				message="Please only use integer values with no decimals for area and depth parameters. Using default values instead."
-			)
-			self.paramArea = 400
-			self.paramDepth = 12
+		# the engine runs once per layer, so a bad parameter must not put up a modal alert
+		self.paramArea = master_parameter(self.master, "paramArea", 400)
+		self.paramDepth = master_parameter(self.master, "paramDepth", 12)
 		self.paramOver = 0  # self.master.customParameters["paramOver"] or 0
 		self.paramFreq = 4  # self.master.customParameters["paramFreq"] or 4
 
-		self.l_polygon = None
-		self.r_polygon = None
+		self.valid = True
+
 		if ".tosf" in self.glyph.name or ".tf" in self.glyph.name \
 			or self.glyph.widthMetricsKey or self.layer.widthMetricsKey \
 			or self.font.customParameters["isFixedPitch"]:
@@ -210,20 +278,32 @@ class HTLSEngine:
 
 		self.rule = self.find_exception()
 		if self.rule:
-			self.factor = float(self.rule["value"])
-			reference_glyph = self.font.glyphs[self.rule["referenceGlyph"]]
+			try:
+				self.factor = float(self.rule["value"])
+			except (TypeError, ValueError):
+				self.factor = 1
+			reference_name = self.rule.get("referenceGlyph")
+			reference_glyph = self.font.glyphs[reference_name] if reference_name else None
 			if reference_glyph:
-				self.reference_layer = reference_glyph.layers[self.layer.associatedMasterId]
+				reference_layer = reference_glyph.layers[self.layer.associatedMasterId]
+				if reference_layer is not None:
+					self.reference_layer = reference_layer
 
 		self.output += "Reference: %s\nFactor: %s" % (self.reference_layer.parent.name, float(self.factor))
 
 		if parent:
-			if self.parent.leftGlyphView.glyph.name == self.glyph.name:
-				self.parent.parametersTab.leftGlyphView.glyphInfo.factor.set("Factor: %s" % self.factor)
-			if self.parent.rightGlyphView.glyph.name == self.glyph.name:
-				self.parent.parametersTab.rightGlyphView.glyphInfo.factor.set("Factor: %s" % self.factor)
+			try:
+				if self.parent.leftGlyphView.glyph_name == self.glyph.name:
+					self.parent.parametersTab.leftGlyphView.glyphInfo.factor.set("Factor: %s" % self.factor)
+				if self.parent.rightGlyphView.glyph_name == self.glyph.name:
+					self.parent.parametersTab.rightGlyphView.glyphInfo.factor.set("Factor: %s" % self.factor)
+			except Exception:
+				print("HT Letterspacer: could not update the factor display\n%s" % traceback.format_exc())
 
 	def find_exception(self):
+		if not self.valid:
+			return None
+
 		glyph = self.glyph
 		name = glyph.name
 		category = glyph.category
@@ -239,9 +319,9 @@ class HTLSEngine:
 		# highly un-dynamic best rule determination incoming pog
 
 		for id in self.config[category]:
-			rule_subcategory = self.config[category][id]["subcategory"]
-			rule_case = self.config[category][id]["case"]
-			rule_filter = self.config[category][id]["filter"] or None
+			rule_subcategory = self.config[category][id].get("subcategory")
+			rule_case = self.config[category][id].get("case")
+			rule_filter = self.config[category][id].get("filter") or None
 
 			# check for rules with defined subcategory, defined case and defined filter
 			if subcategory == rule_subcategory:
@@ -253,9 +333,9 @@ class HTLSEngine:
 
 		if not rule:
 			for id in self.config[category]:
-				rule_subcategory = self.config[category][id]["subcategory"]
-				rule_case = self.config[category][id]["case"]
-				rule_filter = self.config[category][id]["filter"] or None
+				rule_subcategory = self.config[category][id].get("subcategory")
+				rule_case = self.config[category][id].get("case")
+				rule_filter = self.config[category][id].get("filter") or None
 
 				# check for rules with defined subcategory, defined case and no filter
 				if subcategory == rule_subcategory:
@@ -267,9 +347,9 @@ class HTLSEngine:
 
 		if not rule:
 			for id in self.config[category]:
-				rule_subcategory = self.config[category][id]["subcategory"]
-				rule_case = self.config[category][id]["case"]
-				rule_filter = self.config[category][id]["filter"] or None
+				rule_subcategory = self.config[category][id].get("subcategory")
+				rule_case = self.config[category][id].get("case")
+				rule_filter = self.config[category][id].get("filter") or None
 
 				# check for rules with undefined subcategory, defined case and defined filter
 				if rule_subcategory == "Any":
@@ -281,9 +361,9 @@ class HTLSEngine:
 
 		if not rule:
 			for id in self.config[category]:
-				rule_subcategory = self.config[category][id]["subcategory"]
-				rule_case = self.config[category][id]["case"]
-				rule_filter = self.config[category][id]["filter"] or None
+				rule_subcategory = self.config[category][id].get("subcategory")
+				rule_case = self.config[category][id].get("case")
+				rule_filter = self.config[category][id].get("filter") or None
 
 				# check for rules with undefined subcategory, defined case and no filter
 				if rule_subcategory == "Any":
@@ -295,13 +375,13 @@ class HTLSEngine:
 
 		if not rule:
 			for id in self.config[category]:
-				rule_subcategory = self.config[category][id]["subcategory"]
-				rule_case = self.config[category][id]["case"]
-				rule_filter = self.config[category][id]["filter"] or None
+				rule_subcategory = self.config[category][id].get("subcategory")
+				rule_case = self.config[category][id].get("case")
+				rule_filter = self.config[category][id].get("filter") or None
 
 				# check for rules with undefined subcategory, undefined case and defined filter
 				if rule_subcategory == "Any":
-					if rule_case == "Any":
+					if rule_case in (0, "Any"):
 						if rule_filter and rule_filter in name:
 							rule = dict(self.config[category][id])
 							rule_id = id
@@ -309,13 +389,13 @@ class HTLSEngine:
 
 		if not rule:
 			for id in self.config[category]:
-				rule_subcategory = self.config[category][id]["subcategory"]
-				rule_case = self.config[category][id]["case"]
-				rule_filter = self.config[category][id]["filter"] or None
+				rule_subcategory = self.config[category][id].get("subcategory")
+				rule_case = self.config[category][id].get("case")
+				rule_filter = self.config[category][id].get("filter") or None
 
 				# check for rules with undefined subcategory, undefined case and no filter
 				if rule_subcategory == "Any":
-					if rule_case == "Any":
+					if rule_case in (0, "Any"):
 						if not rule_filter:
 							rule = dict(self.config[category][id])
 							rule_id = id
@@ -347,6 +427,9 @@ class HTLSEngine:
 
 	# process lists with depth, proportional to xheight
 	def set_depth(self, margins_l, margins_r, l_extreme, r_extreme):
+		if not margins_l or not margins_r:
+			return margins_l, margins_r
+
 		depth = self.xHeight * self.paramDepth / 100
 		maxdepth = l_extreme.x + depth
 		mindepth = r_extreme.x - depth
@@ -386,26 +469,27 @@ class HTLSEngine:
 		]
 
 	def calculate_sb_value(self, polygon):
-		try:
-			amplitude_y = self.maxYref - self.minYref
+		amplitude_y = self.maxYref - self.minYref
+		# a zero reference zone or a master without an x-height would divide by zero
+		if not amplitude_y or not self.xHeight:
+			return None
 
-			# recalculates area based on UPM
-			area_upm = self.paramArea * ((self.upm / 1000) ** 2)
-			# calculates proportional area
-			white_area = area_upm * self.factor * 100
+		# recalculates area based on UPM
+		area_upm = self.paramArea * ((self.upm / 1000) ** 2)
+		# calculates proportional area
+		white_area = area_upm * self.factor * 100
 
-			prop_area = (amplitude_y * white_area) / self.xHeight
+		prop_area = (amplitude_y * white_area) / self.xHeight
 
-			valor = prop_area - area(polygon)
-			return valor / amplitude_y
-		except:
-			import traceback
-			print(traceback.format_exc())
+		valor = prop_area - area(polygon)
+		return valor / amplitude_y
 
 	def calculate_polygons(self):
-		if not self.layer.name or len(self.layer.components) + len(self.layer.paths) == 0:
+		if not self.valid:
 			return
-		elif self.layer.hasAlignedWidth():
+		elif not self.layer.name or len(self.layer.components) + len(self.layer.paths) == 0:
+			return
+		elif has_aligned_width(self.layer):
 			self.output = "Glyph %s has aligned width. Skipping.\n__________________\n" % self.glyph.name
 			return
 		elif self.glyph.leftMetricsKey:
@@ -420,8 +504,12 @@ class HTLSEngine:
 
 		self.output += "\n__________________\n"
 		# Decompose layer for analysis, as the deeper plumbing assumes to be looking at outlines.
-		layer_decomposed = self.layer.copyDecomposedLayer()
-		layer_decomposed.parent = self.glyph
+		try:
+			layer_decomposed = self.layer.copyDecomposedLayer()
+			layer_decomposed.parent = self.glyph
+		except Exception:
+			self.output += "Could not decompose the layer. Skipping.\n%s\n" % traceback.format_exc()
+			return
 		# get reference glyph maximum points
 		overshoot = self.overshoot()
 
@@ -464,6 +552,10 @@ class HTLSEngine:
 		# get zone extreme points
 		l_extreme, r_extreme = max_points([l_zone_margins, r_zone_margins])
 
+		if None in (self.l_full_extreme, self.r_full_extreme, l_extreme, r_extreme):
+			self.output += "No outlines in the reference zone. Skipping.\n"
+			return
+
 		# dif between extremes full and zone
 		self.distance_l = math.ceil(l_extreme.x - self.l_full_extreme.x)
 		self.distance_r = math.ceil(self.r_full_extreme.x - r_extreme.x)
@@ -477,8 +569,13 @@ class HTLSEngine:
 		if not self.calculate_polygons():
 			return
 
-		self.newL = math.ceil(0 - self.distance_l + self.calculate_sb_value(self.l_polygon))
-		self.newR = math.ceil(0 - self.distance_r + self.calculate_sb_value(self.r_polygon))
+		l_value = self.calculate_sb_value(self.l_polygon)
+		r_value = self.calculate_sb_value(self.r_polygon)
+		if l_value is None or r_value is None:
+			return
+
+		self.newL = math.ceil(0 - self.distance_l + l_value)
+		self.newR = math.ceil(0 - self.distance_r + r_value)
 
 		if self.tabular_width:
 			width_shape = self.r_full_extreme.x - self.l_full_extreme.x
@@ -505,8 +602,12 @@ class HTLSScript:
 			Message("No font selected", "Select a font project!")
 			return
 
-		if not self.font.selectedFontMaster.customParameters["paramArea"] \
-			or not self.font.selectedFontMaster.customParameters["paramDepth"]:
+		master = self.font.selectedFontMaster
+		if master is None:
+			Message("Open the font in an Edit view first.", "No master selected")
+			return
+
+		if not master.customParameters["paramArea"] or not master.customParameters["paramDepth"]:
 			Message(
 				title="Missing configuration",
 				message="Please set up parameters in HTLS Manager. Using default values."
@@ -517,7 +618,7 @@ class HTLSScript:
 			for layer in parent.layers:
 				if not layer.isMasterLayer:
 					continue
-				if not all_masters and layer.associatedMasterId != self.font.selectedFontMaster.id:
+				if not all_masters and layer.associatedMasterId != master.id:
 					continue
 				self.engine = HTLSEngine(layer)
 
