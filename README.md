@@ -17,7 +17,7 @@ Todo:
 - Expand functionality for separate writing systems
 - accomodate paramOver (?)
 
-Known bugs:
-- Changing the frontmost font can result in crashes and unexpected behaviour. Still trying to figure out how to deal with this.
+Notes:
+- The window belongs to the font it was opened for. It closes with that font, and re-opening it from the Glyph menu brings up the window for the frontmost font.
 
 ![Visually adjust parameters](HTLSManager.png)
